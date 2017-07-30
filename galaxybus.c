@@ -398,7 +398,7 @@ doorman (void *d)
 		  {
 		    door[d].mainlock.timer = 10;
 		    door[d].deadlock.timer = 10;
-		    state = (open ? DOOR_OPEN : DOOR_LOCKING);
+		    state = (open ? DOOR_UNLOCKING : DOOR_LOCKING);
 		  }
 		else if (state == DOOR_OPEN && door[d].time_prop && door[d].timer >= door[d].time_prop)
 		  state = DOOR_PROPPED;
@@ -456,6 +456,8 @@ doorman (void *d)
 void *
 poller (void *d)
 {
+  char *argv[] = { "bus" };
+#include <trace.h>
   int busid = (long) d;
   if (busid < 0 || busid >= MAX_BUS)
     errx (1, "Bad bus ID to start %d", busid);
@@ -486,7 +488,7 @@ poller (void *d)
     }
   struct termios t = { 0
   };
-  t.c_cflag = B9600 | CS8 | CSTOPB | CREAD | CLOCAL;
+  t.c_cflag = B9600 | CS8 | CREAD | CLOCAL;	// 9600Baud 1n8
   t.c_cc[VTIME] = 1;
   ioctl (f, TCSETS, &t);
   dev[US].disabled = 1;		// Don't poll ourselves
@@ -561,11 +563,9 @@ poller (void *d)
     e->event = etype;
     return e;
   }
-
-  // TODO cleanup to close f?
-  unsigned char cmd[256];
+  unsigned char cmd[256];	// The command we are sending
   unsigned int cmdlen = 0;
-  unsigned char res[256];
+  unsigned char res[256];	// The response we are receiving
   unsigned int reslen = 0;
   int errors = 0;		// Protocol errors
   int stalled = 0;		// Stuck sending
@@ -577,27 +577,57 @@ poller (void *d)
   int stall = 0;		// Stall count
   time_t nextka = time (0) + 10;	// next keep alive
   time_t lastsec = 0;		// One second events
+  long long gap = 0;		// Time to first byte response for logging
+  struct timeval timeout = { 0
+  };
+  void sendcmd (void)
+  {				// Send command
+    if (!dev[id].type || dev[id].type != TYPE_PAD)
+      usleep (4000);
+    if (write (f, cmd, cmdlen) != (int) cmdlen)
+      errors++;
+    // Delay for the sending of the command - we do not rx data at this point (though can pick up a break sometimes)
+    usleep (1000000 * (10 * cmdlen + 1) / 9600);	// We send one stop bit, then data with 1 stop on each byte
+    // Timeout for reply
+    timeout.tv_usec = 15000;	// 10ms inter message gap, and then some extra for slower devices
+    if (dev[id].type == TYPE_MAX)
+      timeout.tv_usec += 10000;	// And more for max!!
+    tx += cmdlen;
+    // Debug/dump
+    if (dump || (debug && (cmd[1] != 0x06 || cmdlen > 3) && (cmd[1] != 0x01 || cmdlen > 3) && (cmd[1] != 0x00 || cmdlen > 4)))
+      {				// Debug does not dump boring polls
+	unsigned int n;
+	printf ("%s%X%02X >", type_name[dev[id].type], busid + 1, id);
+	for (n = 0; n < cmdlen - 1; n++)
+	  printf (" %02X", cmd[n]);
+	printf ("\n");
+	fflush (stdout);
+      }
+  }
+  // Main polling loop
   while (1)
     {
       unsigned char type = dev[id].type;
       fd_set readfds;
       FD_ZERO (&readfds);
       FD_SET (f, &readfds);
-      struct timeval timeout = { 0
-      };
-      timeout.tv_usec = 9000;
-      if (!reslen)
-	timeout.tv_usec = 11 * 1000000 * cmdlen / 9600 + 15000;	// First byte - allow our message and response time
-      if (dev[id].type == TYPE_MAX && cmdlen > 1 && (cmd[1] == 6 || cmd[1] == 8))
-	timeout.tv_usec += 15000;	// Max can be slow on some things
+      gettimeofday (&now, &tz);
+      long long reftime = now.tv_sec * 1000000ULL + now.tv_usec;
       int s = select (f + 1, &readfds, NULL, NULL, &timeout);
       if (s > 0)
 	s = read (f, &res[reslen], 1);
       if (s < 0)
 	warn ("Bad rx");
-      gettimeofday (&now, &tz);
       if (s)
 	{			// we have a character
+	  if (!reslen && !*res)
+	    continue;		// An initial break is seeing tail end of us sending
+	  timeout.tv_usec = 7000;	// Inter message gap typically 9 to 10ms
+	  if (!reslen && (debug || dump))
+	    {			// Timing for debug
+	      gettimeofday (&now, &tz);
+	      gap = now.tv_sec * 1000000ULL + now.tv_usec - reftime;
+	    }
 	  rx++;
 	  if (reslen == sizeof (res))
 	    {			// Not sensible
@@ -608,21 +638,23 @@ poller (void *d)
 	  reslen++;
 	  continue;
 	}
-      void sendcmd (void)
-      {				// Send command
-	if (write (f, cmd, cmdlen) != (int) cmdlen)
-	  errors++;
-	tx += cmdlen;
-	if (dump || (debug && (cmd[1] != 0x06 || cmdlen > 3) && (cmd[1] != 0x01 || cmdlen > 3) && (cmd[1] != 0x00 || cmdlen > 4)))
-	  {			// Debug does not dump boring polls
-	    unsigned int n;
-	    printf ("%s%X%02X >", type_name[dev[id].type], busid + 1, id);
-	    for (n = 0; n < cmdlen - 1; n++)
-	      printf (" %02X", cmd[n]);
-	    printf ("\n");
-	    fflush (stdout);
-	  }
-      }
+      // Timeout
+      if (reslen)
+	{			// Dump
+	  if (dump || (debug && (res[0] != US || ((reslen != 4 || res[1] != 0xF4 || res[2] != mydev[id].laststatus) && (reslen != 3 || res[1] != 0xFE) && (type != TYPE_RIO || (res[1] != 0xF1 && res[1] != 0xF7)) && (type != TYPE_RFR || (res[1] != 0xF7 && res[1] != 0xFE && res[1] != 0xFD))))))
+	    {			// debug tries not to log boring
+	      unsigned int n;
+	      printf ("%s%X%02X <", type_name[dev[id].type], busid + 1, id);
+	      for (n = 0; n < reslen - 1; n++)
+		printf (" %02X", res[n]);
+	      if (reslen == 1)
+		printf (" ? %02X", res[n]);	// too short?
+	      printf (" (%lld.%lldms)\n", gap / 1000, gap / 100 % 10);
+	      fflush (stdout);
+	    }
+	  if (reslen == 4 && res[0] == US && res[1] == 0xF4)
+	    mydev[id].laststatus = res[2];
+	}
       int fail (void)
       {				// Failed rx
 	if (cmdlen && cmd[1])
@@ -670,8 +702,14 @@ poller (void *d)
 	}
       if (reslen && res[0] != US && fail ())
 	continue;		// Not to us - should we consider this some sort of tamper?
+      if (reslen == 3 && res[1] == 0xF2)
+	{			// Did not understand
+	  errors++;
+	  fail ();
+	  continue;
+	}
       retry = 0;
-// Process response in context of cmd sent
+      // Process response in context of cmd sent
       if (reslen && cmdlen)
 	{
 	  if (!mydev[id].polling)
@@ -699,6 +737,8 @@ poller (void *d)
 		}
 	      else if (res[2] & 0x20)
 		type = TYPE_RIO;
+	      else if (res[2] == 0x10)
+		type = TYPE_RFR;
 	      if (!dev[id].type)
 		{		// New
 		  if (debug)
@@ -726,152 +766,186 @@ poller (void *d)
 		  postevent (newevent (EVENT_FOUND));
 		}
 	    }
-	  if (res[1] == 0xF2)
-	    errors++;		// F2 is bad checksum,, or unknown command, so treat so not confirmed
-	  else
-	    switch (type)
+	  switch (type)
+	    {
+	    case TYPE_MAX:	// Data from max
 	      {
-	      case TYPE_MAX:	// Data from max
-		{
-		  if ((res[1] == 0xF4 || res[1] == 0xFC) && reslen > 3)
-		    {
-		      dev[id].found = 1;
-		      unsigned long was = mydev[id].tamper;
-		      if (res[1] == 0xFC)
-			mydev[id].tamper |= ((1 << MAX_INPUT) | (1 << INPUT_MAX_OPEN) | (1 << INPUT_MAX_EXIT));
-		      else
-			mydev[id].tamper &= ~((1 << MAX_INPUT) | (1 << INPUT_MAX_OPEN) | (1 << INPUT_MAX_EXIT));
-		      if (res[2] & 0x10)
-			mydev[id].input &= ~(1 << INPUT_MAX_OPEN);
-		      else
-			mydev[id].input |= (1 << INPUT_MAX_OPEN);
-		      if (res[2] & 0x20)
-			mydev[id].input |= (1 << INPUT_MAX_EXIT);
-		      else
-			mydev[id].input &= ~(1 << INPUT_MAX_EXIT);
-		      if (reslen > 4)
-			{
-			  unsigned long n = (res[2] & 0x0F), q;
-			  for (q = 3; q < reslen - 1; q++)
-			    n = n * 100 + (res[q] >> 4) * 10 + (res[q] & 0xF);
-			  if (!(mydev[id].input & (1 << INPUT_MAX_FOB)))
-			    {	// Fob starts
-			      event_t *e = newevent (EVENT_FOB);
-			      e->fob = n;
-			      postevent (e);
-			      mydev[id].input |= (1 << INPUT_MAX_FOB);
-			      if (dev[id].fob_hold)
-				mydev[id].fobheld = now.tv_sec * 1000000ULL + now.tv_usec + dev[id].fob_hold * 100000ULL;
-			      else
-				mydev[id].fobheld = 0;
-			    }
-			  else if (mydev[id].fobheld && now.tv_sec * 1000000ULL + now.tv_usec > mydev[id].fobheld)
-			    {	// Fob held
-			      mydev[id].input |= (1 << INPUT_MAX_FOB_HELD);
+		if ((res[1] == 0xF4 || res[1] == 0xFC) && reslen > 3)
+		  {
+		    dev[id].found = 1;
+		    unsigned long was = mydev[id].tamper;
+		    if (res[1] == 0xFC)
+		      mydev[id].tamper |= ((1 << MAX_INPUT) | (1 << INPUT_MAX_OPEN) | (1 << INPUT_MAX_EXIT));
+		    else
+		      mydev[id].tamper &= ~((1 << MAX_INPUT) | (1 << INPUT_MAX_OPEN) | (1 << INPUT_MAX_EXIT));
+		    if (res[2] & 0x10)
+		      mydev[id].input &= ~(1 << INPUT_MAX_OPEN);
+		    else
+		      mydev[id].input |= (1 << INPUT_MAX_OPEN);
+		    if (res[2] & 0x20)
+		      mydev[id].input |= (1 << INPUT_MAX_EXIT);
+		    else
+		      mydev[id].input &= ~(1 << INPUT_MAX_EXIT);
+		    if (reslen > 4)
+		      {
+			unsigned long n = (res[2] & 0x0F), q;
+			for (q = 3; q < reslen - 1; q++)
+			  n = n * 100 + (res[q] >> 4) * 10 + (res[q] & 0xF);
+			if (!(mydev[id].input & (1 << INPUT_MAX_FOB)))
+			  {	// Fob starts
+			    event_t *e = newevent (EVENT_FOB);
+			    e->fob = n;
+			    postevent (e);
+			    mydev[id].input |= (1 << INPUT_MAX_FOB);
+			    if (dev[id].fob_hold)
+			      mydev[id].fobheld = now.tv_sec * 1000000ULL + now.tv_usec + dev[id].fob_hold * 100000ULL;
+			    else
 			      mydev[id].fobheld = 0;
-			      event_t *e = newevent (EVENT_FOB_HELD);
-			      e->fob = n;
-			      postevent (e);
-			    }
-			}
-		      else
-			mydev[id].input &= ~((1 << INPUT_MAX_FOB) | (1 << INPUT_MAX_FOB_HELD));
-		      if (was != mydev[id].tamper)
-			mydev[id].send07 = 1;	// Override internal LEDs
-		    }
-		  break;
-		}
-	      case TYPE_PAD:	// Data from keypad
-		{
-		  if (res[1] == 0xF4 && reslen > 3)
-		    {		// Status
-		      dev[id].found = 1;
-		      if (res[2] & 0x40)
-			mydev[id].tamper |= (1 << MAX_INPUT);
-		      else
-			mydev[id].tamper &= ~(1 << MAX_INPUT);
-		      if (res[2] != 0x7F)
-			{	// key
-			  event_t *e = newevent (EVENT_KEY);
-			  e->key = "0123456789BA\n\e*#"[res[2] & 0x0F];
-			  postevent (e);
-			  mydev[id].send0B = 1;
-			  more = 1;	// Don't get distracted with an urgent device as we'll end up seeing this key again if we do
-			}
-		      break;
-		    }
-		  if (res[1] == 0xFE)
-		    mydev[id].tamper &= ~(1 << MAX_INPUT);	// idle (no tamper)
-		  break;
-		}
-	      case TYPE_RIO:	// Date from RIO
-		{
-		  if (res[1] == 0xF8 && reslen > 11 && (res[6] & 0x01))
-		    mydev[id].tamper |= (1 << MAX_INPUT);	// tamper
-		  else if (res[1] == 0xFE || (res[1] == 0xF8 && reslen > 11 && !(res[6] & 0x01)))
-		    mydev[id].tamper &= ~(1 << MAX_INPUT);	// no tamper
-		  if (res[1] == 0xF1)
-		    {		// Voltages
-		      unsigned int p = 2;
-		      unsigned int n;
-		      for (n = 0; n < MAX_INPUT && p + 1 < reslen; n++)
-			{
-			  dev[id].ri[n].resistance = (res[p] << 8) + res[p + 1];
-			  p += 2;
-			}
-		      for (; n < MAX_INPUT; n++)
-			dev[id].ri[n].resistance = 0;
-		      for (n = 0; n < sizeof (dev[id].voltage) / sizeof (*dev[id].voltage) && p + 1 < reslen; n++)
-			{
-			  dev[id].voltage[n] = (res[p] << 8) + res[p + 1];
-			  p += 2;
-			}
-		      if (n < sizeof (dev[id].voltage) / sizeof (*dev[id].voltage))
-			for (; n < sizeof (dev[id].voltage) / sizeof (*dev[id].voltage); n++)
-			  dev[id].voltage[n] = 0;
-		      else if (p + 1 < reslen)
-			{	// Flags
-			  if (res[p] & 0x80)
-			    mydev[id].fault &= ~(1 << FAULT_RIO_NO_PWR);
-			  else
-			    mydev[id].fault |= (1 << FAULT_RIO_NO_PWR);
-			  if (res[p] & 0x40)
-			    mydev[id].fault &= ~(1 << FAULT_RIO_NO_BAT);
-			  else
-			    mydev[id].fault |= (1 << FAULT_RIO_NO_BAT);
-#if 0				// Looks like 0x20 may be charging, and stops briefly every hour
-			  if (res[p] & 0x20)
-			    mydev[id].fault |= (1 << FAULT_RIO_BAD_BAT);
-			  else
-			    mydev[id].fault &= ~(1 << FAULT_RIO_BAD_BAT);
-#endif
-			}
-		    }
-		  if (res[1] == 0xF8)
-		    {		// Status
-		      dev[id].found = 1;
-		      mydev[id].input = res[2];
-		      mydev[id].fault = ((mydev[id].fault & ~0xFF) | res[4] | res[5]);
-		      dev[id].low = (res[5] | res[7]);	// combined with tamper and fault can work out what state it is...
-		      mydev[id].tamper = ((mydev[id].tamper & ~0xFF) | res[3]);
-		    }
-		  break;
-		}
+			  }
+			else if (mydev[id].fobheld && now.tv_sec * 1000000ULL + now.tv_usec > mydev[id].fobheld)
+			  {	// Fob held
+			    mydev[id].input |= (1 << INPUT_MAX_FOB_HELD);
+			    mydev[id].fobheld = 0;
+			    event_t *e = newevent (EVENT_FOB_HELD);
+			    e->fob = n;
+			    postevent (e);
+			  }
+		      }
+		    else
+		      mydev[id].input &= ~((1 << INPUT_MAX_FOB) | (1 << INPUT_MAX_FOB_HELD));
+		    if (was != mydev[id].tamper)
+		      mydev[id].send07 = 1;	// Override internal LEDs
+		  }
+		break;
 	      }
-	}
-      if (reslen)
-	{			// TODO not seeing if not to US, so not loggged...
-	  if (dump || (debug && (res[0] != US || ((reslen != 4 || res[1] != 0xF4 || res[2] != mydev[id].laststatus) && (reslen != 3 || res[1] != 0xFE) && (type != TYPE_RIO || res[1] != 0xF8) && (type != TYPE_RIO || res[1] != 0xF1)))))
-	    {			// debug does not log boring
-	      unsigned int n;
-	      printf ("%s%X%02X <", type_name[dev[id].type], busid + 1, id);
-	      for (n = 0; n < reslen - 1; n++)
-		printf (" %02X", res[n]);
-	      printf ("\n");
-	      fflush (stdout);
+	    case TYPE_PAD:	// Data from keypad
+	      {
+		if (res[1] == 0xF4 && reslen > 3)
+		  {		// Status
+		    dev[id].found = 1;
+		    if (res[2] & 0x40)
+		      mydev[id].tamper |= (1 << MAX_INPUT);
+		    else
+		      mydev[id].tamper &= ~(1 << MAX_INPUT);
+		    if (res[2] != 0x7F)
+		      {		// key
+			event_t *e = newevent (EVENT_KEY);
+			e->key = "0123456789BA\n\e*#"[res[2] & 0x0F];
+			postevent (e);
+			mydev[id].send0B = 1;
+			more = 1;	// Don't get distracted with an urgent device as we'll end up seeing this key again if we do
+		      }
+		    break;
+		  }
+		if (res[1] == 0xFE)
+		  mydev[id].tamper &= ~(1 << MAX_INPUT);	// idle (no tamper)
+		break;
+	      }
+	    case TYPE_RIO:	// Date from RIO
+	      {
+		if (res[1] == 0xF8 && reslen > 11 && (res[6] & 0x01))
+		  mydev[id].tamper |= (1 << MAX_INPUT);	// tamper
+		else if (res[1] == 0xFE || (res[1] == 0xF8 && reslen > 11 && !(res[6] & 0x01)))
+		  mydev[id].tamper &= ~(1 << MAX_INPUT);	// no tamper
+		if (res[1] == 0xF1)
+		  {		// Voltages
+		    unsigned int p = 2;
+		    unsigned int n;
+		    for (n = 0; n < MAX_INPUT && p + 1 < reslen; n++)
+		      {
+			dev[id].ri[n].resistance = (res[p] << 8) + res[p + 1];
+			p += 2;
+		      }
+		    for (; n < MAX_INPUT; n++)
+		      dev[id].ri[n].resistance = 0;
+		    for (n = 0; n < sizeof (dev[id].voltage) / sizeof (*dev[id].voltage) && p + 1 < reslen; n++)
+		      {
+			dev[id].voltage[n] = (res[p] << 8) + res[p + 1];
+			p += 2;
+		      }
+		    if (n < sizeof (dev[id].voltage) / sizeof (*dev[id].voltage))
+		      for (; n < sizeof (dev[id].voltage) / sizeof (*dev[id].voltage); n++)
+			dev[id].voltage[n] = 0;
+		    else if (p + 1 < reslen)
+		      {		// Flags
+			if (res[p] & 0x80)
+			  mydev[id].fault &= ~(1 << FAULT_RIO_NO_PWR);
+			else
+			  mydev[id].fault |= (1 << FAULT_RIO_NO_PWR);
+			if (res[p] & 0x40)
+			  mydev[id].fault &= ~(1 << FAULT_RIO_NO_BAT);
+			else
+			  mydev[id].fault |= (1 << FAULT_RIO_NO_BAT);
+#if 0				// Looks like 0x20 may be charging, and stops briefly every hour
+			if (res[p] & 0x20)
+			  mydev[id].fault |= (1 << FAULT_RIO_BAD_BAT);
+			else
+			  mydev[id].fault &= ~(1 << FAULT_RIO_BAD_BAT);
+#endif
+		      }
+		  }
+		if (res[1] == 0xF8)
+		  {		// Status
+		    dev[id].found = 1;
+		    mydev[id].input = res[2];
+		    mydev[id].fault = ((mydev[id].fault & ~0xFF) | res[4] | res[5]);
+		    dev[id].low = (res[5] | res[7]);	// combined with tamper and fault can work out what state it is...
+		    mydev[id].tamper = ((mydev[id].tamper & ~0xFF) | res[3]);
+		  }
+		break;
+	      }
+	    case TYPE_RFR:	// Data from Rf RIO
+	      {
+		if (res[1] == 0xFE && res[2] == 0x0F)
+		  mydev[id].tamper |= (1 << MAX_INPUT);	// tamper
+		else if (res[1] == 0xFE)
+		  mydev[id].tamper &= ~(1 << MAX_INPUT);	// no tamper
+		if (res[1] == 0xF7)
+		  {		// Status including voltage?
+		    // TODO
+		  }
+		if (res[1] == 0xFE)
+		  {		// Status
+		    // TODO
+		  }
+		if (res[1] == 0xFD && reslen > 12)
+		  {		// RF signal
+		    if (!(res[3] & 0xF0) && !res[6] && !res[8] && !res[9])
+		      {		// Probably a V2GY packet
+			unsigned int serial = ((res[3] << 16) | (res[4] << 8) | res[5]);
+			if (res[10] == 5)
+			  {	// Fob
+			    if (res[7] == 0x20)
+			      {
+				event_t *e = newevent (EVENT_FOB);
+				e->fob = serial;
+				postevent (e);
+				// TODO port?
+			      }
+			    else if (res[7] == 0x40)
+			      {
+				event_t *e = newevent (EVENT_FOB_HELD);
+				e->fob = serial;
+				postevent (e);
+				// TODO port?
+			      }
+			    // TODO
+			  }
+			else
+			  {
+			    // TODO find / create rf device
+			    // TODO Send found, key, status, or tamper events
+			    event_t *e = newevent (EVENT_RF);
+			    e->serial = serial;
+			    e->rfstatus = res[7];
+			    e->rfsignal = res[11];
+			    postevent (e);
+			  }
+		      }
+		  }
+		break;
+	      }
 	    }
-	  if (reslen == 4 && res[0] == US && res[1] == 0xF4)
-	    mydev[id].laststatus = res[2];
 	}
       if (more && stall++ >= MAX_STALL)
 	{
@@ -895,7 +969,7 @@ poller (void *d)
 	{			// Move on to next
 	  stall = 0;
 	  int m = 2;
-	  while (1)
+	  while (m)
 	    {
 	      if (!++id)
 		{		// End of scan cycle
@@ -1040,6 +1114,51 @@ poller (void *d)
 		    {		// Updating display, try to track the change in mydev text as we go and only send what we need to
 		      cmd[++cmdlen] = 0x07;
 		      cmd[++cmdlen] = 0x01 | ((mydev[id].blink = dev[id].blink) ? 0x08 : 0x00) | (mydev[id].toggle07 ? 0x80 : 0);
+		      unsigned int maketext (int dummy, int space)
+		      {
+			int q = cmdlen;
+			if (space)
+			  cmd[++q] = 0x17;	// clear/home
+			for (l = 0; l < 2; l++)
+			  {
+			    for (p = 0; p < 16 && (space ? : mydev[id].text[l][p]) == dev[id].text[l][p]; p++);	// First character changed
+			    if (p == 16)
+			      continue;	// Line not different
+			    if (p < 2)
+			      {	// Start line
+				if (l || !mydev[id].send07)
+				  cmd[++q] = l + 1;
+				p = 0;
+			      }
+			    else
+			      {	// Move cursor
+				cmd[++q] = 0x03;
+				cmd[++q] = (l ? 0x40 : 0) + p;
+			      }
+			    int p2 = p;
+			    for (p2 = 15; p2 > p && (space ? : mydev[id].text[l][p2]) == dev[id].text[l][p2]; p2--);	// Last character changed
+			    while (p <= p2)
+			      {
+				unsigned char c = (dummy ? dev[id].text[l][p] : (mydev[id].text[l][p] = dev[id].text[l][p]));
+				if (c < ' ')
+				  cmd[++q] = ' ';
+				else if (c == '0' && !dev[id].cross)
+				  cmd[++q] = 'O';
+				else
+				  cmd[++q] = c;
+				p++;
+			      }
+			    if (!dummy)
+			      {
+				// Record where we left cursor
+				if (p == 16)
+				  mydev[id].cursor = (mydev[id].cursor & ~0x1F) | (l ? 0 : 0x10);	// wrapped
+				else
+				  mydev[id].cursor = (mydev[id].cursor & ~0x1F) | (l ? 0x10 : 0) | p;
+			      }
+			  }
+			return q;
+		      }
 		      if (mydev[id].send07 || mydev[id].cursor)
 			{
 			  cmd[++cmdlen] = 0x07;	// Cursor off
@@ -1052,43 +1171,23 @@ poller (void *d)
 			    for (p = 0; p < 16; p++)
 			      mydev[id].text[l][p] = ' ';
 			  mydev[id].cursor &= ~0x1F;	// Home
+			  cmdlen = maketext (0, ' ');
 			}
-		      for (l = 0; l < 2; l++)
-			{
-			  for (p = 0; p < 16 && mydev[id].text[l][p] == dev[id].text[l][p]; p++);	// First character changed
-			  if (p == 16)
-			    continue;	// Line not different
-			  if (p < 2)
-			    {	// Start line
-			      if (l || !mydev[id].send07)
-				cmd[++cmdlen] = l + 1;
-			      p = 0;
+		      else
+			{	// Work out if clear/home would be worthwhile
+			  int c1 = maketext (1, ' ');
+			  int c2 = maketext (0, 0);
+			  if (c1 < c2)
+			    {	// Work from blank
+			      for (l = 0; l < 2; l++)
+				for (p = 0; p < 16; p++)
+				  mydev[id].text[l][p] = ' ';
+			      cmdlen = maketext (0, ' ');
 			    }
 			  else
-			    {	// Move cursor
-			      cmd[++cmdlen] = 0x03;
-			      cmd[++cmdlen] = (l ? 0x40 : 0) + p;
-			    }
-			  int p2 = p;
-			  for (p2 = 15; p2 > p && mydev[id].text[l][p2] == dev[id].text[l][p2]; p2--);	// Last character changed
-			  while (p <= p2)
-			    {
-			      unsigned char c = (mydev[id].text[l][p] = dev[id].text[l][p]);
-			      if (c < ' ')
-				cmd[++cmdlen] = ' ';
-			      else if (c == '0' && !dev[id].cross)
-				cmd[++cmdlen] = 'O';
-			      else
-				cmd[++cmdlen] = c;
-			      p++;
-			    }
+			    cmdlen = c2;
+			}
 
-// Record where we left cursor
-			  if (p == 16)
-			    mydev[id].cursor = (mydev[id].cursor & ~0x1F) | (l ? 0 : 0x10);	// wrapped
-			  else
-			    mydev[id].cursor = (mydev[id].cursor & ~0x1F) | (l ? 0x10 : 0) | p;
-			}
 		      unsigned char cursor = dev[id].cursor;
 		      if (cursor)
 			{
@@ -1244,6 +1343,11 @@ poller (void *d)
 		}
 	      break;
 	    }
+	  case TYPE_RFR:	// Output to RF RIO
+	    {
+	      // TODO - is anything sent?
+	      break;
+	    }
 	  }
 
       if (!cmdlen)
@@ -1259,7 +1363,7 @@ poller (void *d)
 	    {			// Check for device
 	      cmd[++cmdlen] = 0;
 	      cmd[++cmdlen] = 0x0E;
-	      if (dev[id].missing)
+	      if (!dev[id].type || dev[id].missing)
 		retry = MAX_RETRY;	// try once
 	    }
 	}

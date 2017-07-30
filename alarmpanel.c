@@ -678,6 +678,20 @@ load_config (const char *configfile)
 	  }
     }
   x = NULL;
+  while ((x = xml_element_next_by_name (config, x, "rf-rio")))
+    {				// Scan inputs, get names
+      if (!(pl = xml_get (x, "@id")) || !*pl)
+	dolog (ALL_GROUPS, "CONFIG", NULL, NULL, "RF RIO with no id");
+      else
+	while (pl)
+	  {
+	    port_t p = port_parse (pl, &pl, 0);
+	    unsigned int id = port_device (p);
+	    if (!id)
+	      dolog (ALL_GROUPS, "CONFIG", NULL, NULL, "Bad address for RF RIO");
+	  }
+    }
+  x = NULL;
   while ((x = xml_element_next_by_name (config, x, "output")))
     {				// Scan inputs, get names
       if (!(pl = xml_get (x, "@id")) || !*pl)
@@ -1738,7 +1752,6 @@ keypad_message (keypad_t * k, char *fmt, ...)
   char *l1 = (char *) device[n].text[0];
   char *l2 = (char *) device[n].text[1];
   device[n].cursor = 0;
-  device[n].silent = 0;
   // Format
   char *msg = NULL;
   va_list ap;
@@ -1780,7 +1793,7 @@ keypad_message (keypad_t * k, char *fmt, ...)
     *nl++ = 0;
   snprintf (l1, 17, "%-16s", v);
   snprintf (l2, 17, "%-16s", nl ? : "");
-  k->when = now.tv_sec + 3;
+  k->when = now.tv_sec + (device[n].silent ? 10 : 3);
   free (msg);
   return NULL;
 }
@@ -1834,11 +1847,13 @@ keypad_update (keypad_t * k, char key)
     }
   if (!k->groups)
     {				// Not in use at all!
-      snprintf (l1, 17, "%-16s", "-- NOT IN USE --");
+      snprintf (l1, 17, "%-16s", k->message ? : "-- NOT IN USE --");
       snprintf (l2, 17, "%02d:%02d %10s", lnow.tm_hour, lnow.tm_min, port_name (k->port));
       device[n].silent = 1;	// No keys
       return NULL;
     }
+  if (key && device[n].silent)
+    return keypad_message (k, "Wait");
   int s;
   group_t trigger = 0;
   for (s = 0; s < STATE_LATCHED; s++)
@@ -1873,7 +1888,6 @@ keypad_update (keypad_t * k, char key)
       if (!(k->groups & state[STATE_ARM]))
 	return keypad_message (k, "CANCELLED SET");	// Nothing left to set
       device[n].cursor = 0;
-      device[n].silent = 1;
       if (k->groups & state[STATE_ARM] & trigger)
 	{			// Not setting
 	  device[n].beep[0] = 0;
@@ -1931,12 +1945,14 @@ keypad_update (keypad_t * k, char key)
 	  k->pininput = 0;
 	  if (key == '\n' || key == 'A')
 	    {			// Login?
-	      if (!k->pin)
-		return keypad_message (k, "INVALID CODE");	// No PIN 0
-	      user_t *u;
-	      for (u = users; u && u->pin != k->pin; u = u->next);
+	      user_t *u = NULL;
+	      if (k->pin)
+		for (u = users; u && u->pin != k->pin; u = u->next);
 	      if (!u)
-		return keypad_message (k, "INVALID CODE");
+		{		// PIN 0 or user not valid
+		  device[n].silent = 1;
+		  return keypad_message (k, "INVALID CODE");
+		}
 	      if (key == 'A')
 		{
 		  if (!alarm_arm (u->name ? : k->name, port_name (k->port), k->groups & u->group_set, 0))
@@ -1987,11 +2003,11 @@ keypad_update (keypad_t * k, char key)
     alert = "\a\aTAMPER!";
   else if (k->groups & state[STATE_BELL])
     alert = "\a\aALARM!";
-  else if (k->groups & state[STATE_FAULT])
+  else if (k->groups & state[STATE_FAULT] & ~state[STATE_ENGINEERING])
     alert = "\aFAULT!";
   else if (k->groups & state[STATE_WARNING])
     alert = "\aWARNING!";
-  else if (k->groups & state[STATE_ENGINEERING])
+  else if (k->user && k->groups & state[STATE_ENGINEERING])
     alert = "ENGINEERING MODE";
   if (alert && *alert == '\a')
     device[n].blink = 1;
@@ -2071,8 +2087,11 @@ keypad_update (keypad_t * k, char key)
     if (s < STATE_LATCHED)
       {
 	snprintf (l2, 17, "RESET %-10s", state_name[s]);
-	device[n].beep[0] = 1;
-	device[n].beep[1] = 49;
+	if ((s != STATE_TAMPER && s != STATE_FAULT) || !(state[STATE_ENGINEERING] & state[STATE_TRIGGERS + s]))
+	  {			// Beep if not engineering
+	    device[n].beep[0] = 1;
+	    device[n].beep[1] = 49;
+	  }
 	return NULL;
       }
     else			// Idle
@@ -2105,6 +2124,8 @@ doevent (event_t * e)
 	printf ("%02X", e->key);
       if (e->event == EVENT_FOB || e->event == EVENT_FOB_HELD)
 	printf (" %09u", e->fob);
+      if (e->event == EVENT_RF)
+	printf ("%07u %02X %2d/10", e->serial, e->rfstatus, e->rfsignal);
       printf ("\n");
     }
   // Simple sanity checks
@@ -2147,6 +2168,8 @@ doevent (event_t * e)
 		mybus[n].fault = 0;
 		rem_fault (groups, busno, NULL);
 	      }
+	    if (e->retries)
+	      syslog (LOG_INFO, "Bus %d retries: %d", n, e->retries);
 	  }
       }
       break;
@@ -2319,7 +2342,7 @@ doevent (event_t * e)
 			  snprintf (doorno, sizeof (doorno), "DOOR%02u", d);
 			  if (!door_locked (d))
 			    {
-			      if (mydoor[d].airlock >= 0 && door[mydoor[d].airlock].state != DOOR_CLOSED && door[mydoor[d].airlock].state != DOOR_DEADLOCKED)
+			      if (mydoor[d].airlock >= 0 && door[mydoor[d].airlock].state != DOOR_LOCKED && door[mydoor[d].airlock].state != DOOR_DEADLOCKED)
 				{
 				  dolog (mydoor[d].groups, "DOORAIRLOCK", NULL, doorno, "Airlock violation with DOOR%02d, exit rejected", mydoor[d].airlock);
 				  door_error (d);
@@ -2525,7 +2548,7 @@ doevent (event_t * e)
 		      {
 			if (u->group_open & mydoor[d].groups & ~state[STATE_SET] & ~state[STATE_ARM])
 			  {
-			    if (mydoor[d].airlock >= 0 && door[mydoor[d].airlock].state != DOOR_CLOSED && door[mydoor[d].airlock].state != DOOR_DEADLOCKED)
+			    if (mydoor[d].airlock >= 0 && door[mydoor[d].airlock].state != DOOR_LOCKED && door[mydoor[d].airlock].state != DOOR_DEADLOCKED)
 			      {
 				dolog (mydoor[d].groups, "DOORAIRLOCK", u->name, doorno, "Airlock violation with DOOR%02d using fob %lu", mydoor[d].airlock, e->fob);
 				door_error (d);
@@ -2574,7 +2597,7 @@ doevent (event_t * e)
 	      }
 	if (!found)
 	  {			// Unassociated max reader
-	    dolog (mydoor[d].groups, e->event == EVENT_FOB_HELD ? "FOBHELDIGNORE" : "FOBIGNORED", u->name, port_name (e->port), "Ignored fob %lu as reader not linked to a door", e->fob);
+	    dolog (groups, e->event == EVENT_FOB_HELD ? "FOBHELDIGNORE" : "FOBIGNORED", u ? u->name : NULL, port_name (e->port), "Ignored fob %lu as reader not linked to a door", e->fob);
 	    door_error (d);
 	  }
       }
@@ -2585,6 +2608,11 @@ doevent (event_t * e)
 	for (k = keypad; k && k->port != e->port; k = k->next);
 	if (k)
 	  keypad_update (k, e->key);
+      }
+      break;
+    case EVENT_RF:
+      {
+	// TODO
       }
       break;
     }
@@ -2689,16 +2717,16 @@ main (int argc, const char *argv[])
     {				// Move a max
       port_t f = port_parse (maxfrom, NULL, -1);
       port_t t = port_parse (maxto, NULL, -1);
-      if (device[f].type != TYPE_MAX)
+      if (!f || device[port_device (f)].type != TYPE_MAX)
 	dolog (groups, "CONFIG", NULL, NULL, "max-from invalid");
-      else if (device[t].type != TYPE_MAX)
+      else if (!t || device[port_device (t)].type != TYPE_MAX)
 	dolog (groups, "CONFIG", NULL, NULL, "max-to invalid");
-      else if ((f >> 16) != (t << 16))
+      else if ((f >> 16) != (t >> 16))
 	dolog (groups, "CONFIG", NULL, NULL, "max-from and max-to on different buses");
       else
 	{
-	  device[f].newid = (t >> 8);
-	  device[f].config = 1;
+	  device[port_device (f)].newid = (t >> 8);
+	  device[port_device (f)].config = 1;
 	}
     }
   state_change (groups);
